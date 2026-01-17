@@ -26,6 +26,7 @@ MODEL_PATH = '/home/duc/shrimp_model.onnx'
 SCALER_PATH = '/home/duc/scaler_params.json'
 INPUT_STEPS = 192
 FEATURE_KEYS = ["temp", "ph", "sal", "turb"] 
+HEARTBEAT_INTERVAL = 60 # Gửi heartbeat mỗi 60s
 
 history_buffer = deque(maxlen=INPUT_STEPS)
 mqtt_connected = False
@@ -35,8 +36,7 @@ packet_loss_total = 0
 # --- HELPER FUNCTIONS ---
 def write_permanent_log(raw_msg):
     try:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Lưu nguyên bản tin nhận được vào file log
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         with open(LOG_FILE, "a") as f: f.write(f"[{ts}] {raw_msg.strip()}\n")
     except: pass
 
@@ -76,7 +76,7 @@ def create_random_sample():
     }
 
 def init_buffer():
-    print("Half-Real Mode: Pre-filling buffer with mock data...")
+    print("Half-Real Mode: Pre-filling buffer...")
     for _ in range(INPUT_STEPS): history_buffer.append(create_random_sample())
 
 # --- MAIN ---
@@ -85,15 +85,12 @@ def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("MQTT Connected.")
         mqtt_connected = True
-        
-        # === BÁO CÁO TRẠNG THÁI ONLINE ===
+        # Gửi Online ngay khi connect
         status_payload = json.dumps({"device_id": DEVICE_ID, "status": "ONLINE"})
         client.publish(TOPIC_STATUS, status_payload, qos=1, retain=True)
-        
-        # Sau đó mới xả hàng tồn kho
         flush_offline_cache(client)
     else:
-        print(f"MQTT Connection Failed: {rc}")
+        print(f"MQTT Failed: {rc}")
         mqtt_connected = False
         
 def on_disconnect(c, u, r): global mqtt_connected; mqtt_connected = False
@@ -101,25 +98,21 @@ def on_disconnect(c, u, r): global mqtt_connected; mqtt_connected = False
 def main():
     global mqtt_connected, last_sequence_id, packet_loss_total
     
-    # Init AI Core
+    # Init AI
     try: predictor = ShrimpPredictor(model_path=MODEL_PATH, scaler_path=SCALER_PATH)
     except: pass
     
-    # Init Buffer
     init_buffer()
     
     # MQTT Setup
     client = mqtt.Client()
-    client.username_pw_set(USERNAME, PASSWORD)
-    client.tls_set()
+    client.username_pw_set(USERNAME, PASSWORD); client.tls_set()
     
-    # === CÀI ĐẶT DI CHÚC (LWT) ===
+    # LWT (Last Will)
     will_payload = json.dumps({"device_id": DEVICE_ID, "status": "OFFLINE"})
     client.will_set(TOPIC_STATUS, will_payload, qos=1, retain=True)
     
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
-    
+    client.on_connect = on_connect; client.on_disconnect = on_disconnect
     try: client.connect(BROKER, PORT, 60); client.loop_start()
     except: pass
     
@@ -127,42 +120,49 @@ def main():
     try: ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     except: return
 
-    print(f"HALF-REAL MODE (Device: {DEVICE_ID}): Ready. Waiting for Real Data...")
+    # Init Heartbeat timer
+    last_heartbeat_time = time.time()
+
+    print(f"HALF-REAL MODE (Device: {DEVICE_ID}): Ready.")
 
     while True:
-        # --- BỎ INA219, GÁN CỨNG PIN ---
+        # --- HEARTBEAT LOGIC ---
+        if mqtt_connected and (time.time() - last_heartbeat_time > HEARTBEAT_INTERVAL):
+            try:
+                hb_payload = json.dumps({"device_id": DEVICE_ID, "status": "ONLINE"})
+                client.publish(TOPIC_STATUS, hb_payload, qos=1, retain=True)
+                last_heartbeat_time = time.time()
+            except: pass
+        # -----------------------
+
+        # Battery giả
         batt_stat = "+98" 
         
         line = ser.readline()
         if line:
             try:
-                # Decode dữ liệu thô
                 raw_data = line.decode('utf-8', errors='ignore')
                 
-                # 1. LƯU LOG TOÀN BỘ BẢN TIN (Ngay khi nhận được, chưa xử lý)
-                if raw_data.strip():
-                    write_permanent_log(raw_data)
+                # Log raw
+                if raw_data.strip(): write_permanent_log(raw_data)
 
-                # Sau đó mới xử lý cắt gọt để dùng
                 decoded = raw_data.strip()
-                
                 if decoded:
                     parsed = parse_lora_data(decoded)
                     
                     if parsed:
-                        # 1. Packet Loss Logic
+                        # 1. Packet Loss
                         curr_seq = parsed["seq"]
                         if last_sequence_id != -1 and curr_seq != last_sequence_id + 1:
                             if curr_seq > last_sequence_id:
-                                missed = curr_seq - last_sequence_id - 1
-                                packet_loss_total += missed
+                                packet_loss_total += (curr_seq - last_sequence_id - 1)
                         last_sequence_id = curr_seq
 
-                        # 2. Update Buffer (REAL DATA)
+                        # 2. Update Buffer
                         new_data = {"temp": parsed["temp"], "ph": parsed["ph"], "sal": parsed["sal"], "turb": parsed["turb"]}
                         history_buffer.append(new_data)
 
-                        # 3. Predict & Publish
+                        # 3. Predict
                         formatted_preds = []
                         raw_input = [[item[k] for k in FEATURE_KEYS] for item in history_buffer]
                         pred_array = predictor.predict(raw_input) if 'predictor' in locals() else None
@@ -171,7 +171,7 @@ def main():
                             for i, row in enumerate(pred_array):
                                 formatted_preds.append({"step": i+1, "temp": round(float(row[0]),2), "ph": round(float(row[1]),2), "sal": round(float(row[2]),2), "turb": round(float(row[3]),2)})
                         
-                        # 4. Tạo Payload (KHÔNG CÓ TIMESTAMP)
+                        # 4. Payload (No Timestamp)
                         payload = {
                             "device_id": parsed["id"],
                             "location": parsed["loc"],
@@ -185,7 +185,7 @@ def main():
                         if mqtt_connected:
                             flush_offline_cache(client)
                             client.publish(TOPIC_DATA, json.dumps(payload))
-                            print(f"Published Data (Seq: {curr_seq})")
+                            print(f"Published (Seq: {curr_seq})")
                         else:
                             save_to_offline_cache(payload)
                             print(f"Saved Offline (Seq: {curr_seq})")
