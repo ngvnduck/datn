@@ -1,14 +1,15 @@
 #include <HardwareSerial.h>
 #include <WiFi.h>
 #include "time.h"
+#include <sys/time.h> // Thư viện để lấy mili giây
 
-// --- CẤU HÌNH WIFI (SỬA LẠI TÊN VÀ PASS CỦA BẠN) ---
-const char* ssid     = "TEN_WIFI_CUA_BAN"; 
-const char* password = "MAT_KHAU_WIFI";
+// --- CẤU HÌNH WIFI ---
+const char* ssid     = "Van Duc"; 
+const char* password = "duc051103";
 
 // --- CẤU HÌNH THỜI GIAN (NTP) ---
 const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 7 * 3600;       // UTC+7 cho Việt Nam
+const long  gmtOffset_sec = 7 * 3600;
 const int   daylightOffset_sec = 0;
 
 // --- CẤU HÌNH LORA ---
@@ -18,27 +19,26 @@ HardwareSerial LoRaSerial(1); // UART1
 
 // --- BIẾN DỮ LIỆU ---
 long seq_id = 1;          
-String device_id = "gw_rpi4";
-String location = "node01";
+String device_id = "node01";
+String location = "pond01";
 
-// Dữ liệu giả lập
-float temp = 28;
+float temp = 28.5;
 float ph = 7.5;
 float sal = 15.2;
 float turb = 10.5;
 
 void setup() {
   Serial.begin(115200);
-
-  // 1. Khởi tạo UART cho LoRa
   LoRaSerial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
-  Serial.println("\n--- ESP32 LoRa Transmitter ---");
 
-  // 2. Kết nối WiFi
-  Serial.print("Connecting to WiFi");
+  Serial.println("\n--- ESP32 LoRa Transmitter (High Precision Time) ---");
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  
   WiFi.begin(ssid, password);
+  
   int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+  while (WiFi.status() != WL_CONNECTED && retry < 60) {
     delay(500);
     Serial.print(".");
     retry++;
@@ -46,39 +46,50 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi Connected!");
-    // 3. Cấu hình thời gian
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    Serial.println("Time synced with NTP server.");
+    Serial.println("Waiting for NTP sync...");
+
+    struct tm timeinfo;
+    // Bắt buộc chờ có giờ mới chạy tiếp
+    while(!getLocalTime(&timeinfo)){
+        Serial.print(".");
+        delay(200);
+    }
+    Serial.println("\nTime Synced!");
   } else {
-    Serial.println("\nWiFi connection failed. Time will be incorrect.");
+    Serial.println("\nWiFi Failed! System time will be wrong.");
   }
 }
 
-// === HÀM LẤY GIỜ ĐÃ SỬA ===
-String getLocalTimeStr() {
+// === HÀM LẤY GIỜ MỚI (CÓ MILI GIÂY) ===
+String getDetailedTimeStr() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL); 
+
   struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    return "00:00:00"; 
-  }
-  char timeStringBuff[10]; // Giảm bộ nhớ đệm vì chuỗi giờ ngắn
-  
-  // %H: Giờ (00-23)
-  // %M: Phút (00-59)
-  // %S: Giây (00-59)
-  strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M:%S", &timeinfo);
-  
-  return String(timeStringBuff);
+  getLocalTime(&timeinfo);
+
+  char timeBuff[20];
+  strftime(timeBuff, sizeof(timeBuff), "%H:%M:%S", &timeinfo);
+
+  char finalBuff[30];
+  // Ghép chuỗi: "HH:MM:SS" + "." + "mili_giây"
+  snprintf(finalBuff, sizeof(finalBuff), "%s.%03ld", timeBuff, tv.tv_usec / 1000);
+
+  return String(finalBuff);
 }
 
 void loop() {
-  // Check kết nối
+  // Check WiFi
   if(WiFi.status() != WL_CONNECTED) {
      WiFi.reconnect();
   }
 
-  String timeStr = getLocalTimeStr();
+  // Lấy giờ chi tiết
+  String timeStr = getDetailedTimeStr();
 
   // Tạo bản tin
+  // Ví dụ: 1,gw_rpi4,pond_01,28.50,7.50,15.20,10.50,13:11:22.185,END
   String packet = String(seq_id) + "," + 
                   device_id + "," + 
                   location + "," + 
@@ -93,5 +104,5 @@ void loop() {
   Serial.println("Sending: " + packet);
 
   seq_id++;
-  delay(20000); 
+  delay(10000); // Gửi mỗi 10 giây
 }
