@@ -2,6 +2,7 @@ import time
 import json
 import serial
 import os
+import random
 import paho.mqtt.client as mqtt
 from datetime import datetime
 from collections import deque
@@ -16,10 +17,9 @@ PASSWORD = "Ducnv213698"
 TOPIC_DATA = "aquafarm/data"
 TOPIC_STATUS = "aquafarm/status"
 
-GATEWAY_ID = "gw_rpi4" # ID của Gateway
+GATEWAY_ID = "gw_rpi4"
 LOG_FILE = "/home/duc/log.txt"
 OFFLINE_CACHE_FILE = "/home/duc/offline_cache.jsonl"
-
 SERIAL_PORT = "/dev/serial0"
 BAUD_RATE = 9600
 
@@ -29,58 +29,73 @@ SCALER_PATH = '/home/duc/scaler_params.json'
 INPUT_STEPS = 192
 FEATURE_KEYS = ["temp", "ph", "sal", "turb"] 
 
-# Pin Configuration (2S Li-ion)
+# Battery Config (2S Li-ion)
 BATTERY_MAX_V = 8.4
 BATTERY_MIN_V = 6.0
-SHUTDOWN_VOLTAGE = 6.3 
+SHUTDOWN_VOLTAGE = 6.2
 
 # Global state
 history_buffer = deque(maxlen=INPUT_STEPS)
 mqtt_connected = False
 last_sequence_id = -1
-packet_loss_total = 0
 
-# --- CLASS: UPS MONITOR (Sử dụng INA219 thật) ---
+# --- CLASS: UPS MONITOR (Updated fix for INA219) ---
 class UPSMonitor:
-    def __init__(self, addr=0x40):
+    def __init__(self, addr=0x40, bus=1):
         try:
-            self.ina = INA219(shunt_ohms=0.1, address=addr)
+            # Thêm tham số busnum để tránh lỗi I2C
+            self.ina = INA219(shunt_ohms=0.1, address=addr, busnum=bus)
             self.ina.configure()
             self.is_active = True
-        except:
+            print("INA219 Initialized Successfully.")
+        except Exception as e:
             self.is_active = False
-            print("Warning: INA219 not found.")
+            print(f"INA219 Init Failed: {e}")
 
     def read_status(self):
         if not self.is_active: return "ERR"
         try:
             voltage = self.ina.voltage()
-            current = self.ina.current()
+            current = self.ina.current() # mA
+            
+            # Tính % pin dựa trên dải điện áp 6.0V - 8.4V
             pct = int(max(0, min(100, ((voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) * 100)))
             
-            # Tự động bảo vệ pin
-            if current < -5 and voltage < SHUTDOWN_VOLTAGE:
+            # Bảo vệ hệ thống: Tắt máy nếu pin quá yếu khi đang xả (current < 0)
+            if current < -10 and voltage < SHUTDOWN_VOLTAGE:
+                print("CRITICAL BATTERY: Shutting down...")
                 os.system("sudo halt")
                 return "HALT"
             
-            return f"+{pct}" if current > 2 else f"-{pct}"
+            # Trả về định dạng + (đang sạc) hoặc - (đang xả)
+            return f"+{pct}" if current > 5 else f"-{pct}"
         except:
             return "ERR"
 
 # --- HELPER FUNCTIONS ---
+def create_random_sample():
+    """Tạo mẫu dữ liệu ngẫu nhiên để pre-fill buffer"""
+    return {
+        "temp": round(random.uniform(25.0, 32.0), 2),
+        "ph": round(random.uniform(7.0, 8.5), 2),
+        "sal": round(random.uniform(10.0, 25.0), 2),
+        "turb": round(random.uniform(5.0, 50.0), 2)
+    }
+
+def init_buffer():
+    """Làm đầy 192 buffer ban đầu bằng dữ liệu random"""
+    print(f"Pre-filling buffer with {INPUT_STEPS} samples...")
+    for _ in range(INPUT_STEPS):
+        history_buffer.append(create_random_sample())
+
 def parse_lora_data(raw_str):
-    """ Parse: Seq, Node_ID, Location, Temp, pH, Sal, Turb """
     try:
         parts = [p.strip() for p in raw_str.replace("END", "").split(',')]
         if len(parts) >= 7:
             return {
-                "seq": int(parts[0]), 
-                "node_id": parts[1], 
-                "loc": parts[2],
-                "temp": float(parts[3]), 
-                "ph": float(parts[4]), 
-                "sal": float(parts[5]), 
-                "turb": float(parts[6])
+                "seq": int(parts[0]), "node_id": parts[1], "loc": parts[2],
+                "temp": float(parts[3]), "ph": float(parts[4]), 
+                "sal": float(parts[5]), "turb": float(parts[6])
             }
         return None
     except: return None
@@ -93,7 +108,6 @@ def write_permanent_log(raw_msg):
 
 def save_to_offline_cache(payload):
     try:
-        # Cache bản tin tinh gọn khi mất mạng
         clean = {k: v for k, v in payload.items() if k not in ["predict", "battery"]}
         with open(OFFLINE_CACHE_FILE, "a") as f: f.write(json.dumps(clean) + "\n")
     except: pass
@@ -124,20 +138,22 @@ def on_disconnect(c, u, r):
 
 # --- MAIN ---
 def main():
-    global mqtt_connected, last_sequence_id, packet_loss_total
+    global mqtt_connected, last_sequence_id
     
-    # 1. Khởi tạo AI & UPS
+    # 1. Khởi tạo Buffer & AI & UPS
+    init_buffer()
+    
     try: predictor = ShrimpPredictor(model_path=MODEL_PATH, scaler_path=SCALER_PATH)
     except: predictor = None
-    ups = UPSMonitor()
     
-    # 2. Setup MQTT & LWT
+    ups = UPSMonitor(addr=0x40, bus=1)
+    
+    # 2. Setup MQTT
     client = mqtt.Client()
     client.username_pw_set(USERNAME, PASSWORD)
     client.tls_set()
     will_payload = json.dumps({"device_id": GATEWAY_ID, "status": "OFFLINE"})
     client.will_set(TOPIC_STATUS, will_payload, qos=1, retain=True)
-    
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     
@@ -149,13 +165,11 @@ def main():
     # 3. Setup Serial
     try: ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     except Exception as e:
-        print(f"Serial Error: {e}")
-        return
+        print(f"Serial Error: {e}"); return
 
-    print(f"Gateway {GATEWAY_ID} is running...")
+    print(f"Gateway {GATEWAY_ID} is ready. Waiting for LoRa data...")
 
     while True:
-        # Đọc dữ liệu từ Serial
         line = ser.readline()
         if line:
             try:
@@ -166,39 +180,30 @@ def main():
                 parsed = parse_lora_data(raw_data)
                 
                 if parsed:
-                    # Tính toán Packet Loss
-                    curr_seq = parsed["seq"]
-                    if last_sequence_id != -1 and curr_seq > last_sequence_id + 1:
-                        packet_loss_total += (curr_seq - last_sequence_id - 1)
-                    last_sequence_id = curr_seq
-
-                    # Cập nhật Buffer cho AI
+                    # Cập nhật buffer (deque sẽ tự đẩy dữ liệu cũ nhất ra)
                     current_sensor = {
                         "temp": parsed["temp"], "ph": parsed["ph"], 
                         "sal": parsed["sal"], "turb": parsed["turb"]
                     }
                     history_buffer.append(current_sensor)
 
-                    # Chạy dự đoán (Predict)
+                    # Chạy dự đoán (Lúc này buffer luôn luôn đủ 192 mẫu)
                     formatted_preds = []
-                    if predictor and len(history_buffer) == INPUT_STEPS:
+                    if predictor:
                         raw_input = [[item[k] for k in FEATURE_KEYS] for item in history_buffer]
                         pred_array = predictor.predict(raw_input)
                         if pred_array is not None:
-                            # Lấy 32 bước kế tiếp (hoặc theo model output)
                             for i, row in enumerate(pred_array[:32]): 
                                 formatted_preds.append({
                                     "step": i + 1,
-                                    "temp": round(float(row[0]), 2),
-                                    "ph": round(float(row[1]), 2),
-                                    "sal": round(float(row[2]), 2),
-                                    "turb": round(float(row[3]), 2)
+                                    "temp": round(float(row[0]), 2), "ph": round(float(row[1]), 2),
+                                    "sal": round(float(row[2]), 2), "turb": round(float(row[3]), 2)
                                 })
 
-                    # Đọc trạng thái Pin thực tế
+                    # Đọc Pin từ INA219
                     batt_stat = ups.read_status()
 
-                    # --- TẠO BẢN TIN THEO YÊU CẦU ---
+                    # Tạo Payload bản tin
                     payload = {
                         "device_id": GATEWAY_ID,
                         "node_id": parsed["node_id"],
@@ -210,16 +215,16 @@ def main():
                         "battery": batt_stat
                     }
 
-                    # Gửi MQTT
+                    # Gửi đi
                     if mqtt_connected:
                         client.publish(TOPIC_DATA, json.dumps(payload))
-                        print(f"Published Node {parsed['node_id']} - Seq {curr_seq}")
+                        print(f"Sent: Node {parsed['node_id']} | Seq {parsed['seq']} | Batt {batt_stat}")
                     else:
                         save_to_offline_cache(payload)
-                        print(f"Cached Node {parsed['node_id']} - Seq {curr_seq}")
+                        print(f"Cached: Node {parsed['node_id']} | Seq {parsed['seq']}")
 
             except Exception as e:
-                print(f"Error processing data: {e}")
+                print(f"Process Error: {e}")
 
 if __name__ == "__main__":
     main()
