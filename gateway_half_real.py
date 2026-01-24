@@ -9,7 +9,7 @@ from collections import deque
 from ai_core import ShrimpPredictor
 from ina219 import INA219
 
-# --- CONFIGURATION ---
+# --- CẤU HÌNH HỆ THỐNG ---
 BROKER = "5e1faa0dd65748b5b3c5b493359f92ab.s1.eu.hivemq.cloud"
 PORT = 8883
 USERNAME = "ducnv"
@@ -23,34 +23,33 @@ OFFLINE_CACHE_FILE = "/home/duc/offline_cache.jsonl"
 SERIAL_PORT = "/dev/serial0"
 BAUD_RATE = 9600
 
-# AI Model Configuration
+# Cấu hình AI
 MODEL_PATH = '/home/duc/shrimp_model.onnx'
 SCALER_PATH = '/home/duc/scaler_params.json'
 INPUT_STEPS = 192
 FEATURE_KEYS = ["temp", "ph", "sal", "turb"] 
 
-# Battery Config (2S Li-ion 21700)
+# Cấu hình Pin (2S Li-ion 21700)
 BATTERY_MAX_V = 8.4
 BATTERY_MIN_V = 6.0
 SHUTDOWN_VOLTAGE = 6.2
 
-# Global State
+# Trạng thái hệ thống
 history_buffer = deque(maxlen=INPUT_STEPS)
 mqtt_connected = False
-last_sequence_id = -1
 
-# --- CLASS: UPS MONITOR (INA219 Fixed) ---
+# --- LỚP QUẢN LÝ PIN (INA219) ---
 class UPSMonitor:
     def __init__(self, addr=0x40, bus=1):
         try:
-            # Khởi tạo với busnum=1 để khớp với Raspberry Pi
+            # Khởi tạo đúng bus I2C cho Raspberry Pi
             self.ina = INA219(shunt_ohms=0.1, address=addr, busnum=bus)
             self.ina.configure()
             self.is_active = True
-            print("INA219 System: ONLINE")
+            print("INA219: Kết nối thành công.")
         except Exception as e:
             self.is_active = False
-            print(f"INA219 System: FAILED ({e})")
+            print(f"INA219: Lỗi khởi tạo ({e})")
 
     def read_status(self):
         if not self.is_active: return "ERR"
@@ -59,33 +58,30 @@ class UPSMonitor:
             current = self.ina.current()
             pct = int(max(0, min(100, ((voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) * 100)))
             
-            # Tự động tắt máy bảo vệ pin
+            # Bảo vệ Pin: Tắt máy nếu pin quá yếu
             if current < -10 and voltage < SHUTDOWN_VOLTAGE:
                 os.system("sudo halt")
                 return "HALT"
             
+            # +: Đang sạc, -: Đang xả
             return f"+{pct}" if current > 5 else f"-{pct}"
         except:
             return "ERR"
 
-# --- HELPER FUNCTIONS ---
-def create_random_sample():
-    """Tạo dữ liệu ngẫu nhiên để pre-fill buffer"""
-    return {
-        "temp": round(random.uniform(26.0, 30.0), 2),
-        "ph": round(random.uniform(7.5, 8.2), 2),
-        "sal": round(random.uniform(15.0, 20.0), 2),
-        "turb": round(random.uniform(10.0, 30.0), 2)
-    }
-
-def init_buffer():
-    """Làm đầy 192 mẫu ban đầu"""
-    print(f"Pre-filling history buffer with {INPUT_STEPS} samples...")
+# --- HÀM HỖ TRỢ ---
+def init_buffer_with_random():
+    """Làm đầy buffer 192 mẫu ngẫu nhiên để AI chạy được ngay"""
+    print(f"Đang khởi tạo {INPUT_STEPS} mẫu dữ liệu ngẫu nhiên...")
     for _ in range(INPUT_STEPS):
-        history_buffer.append(create_random_sample())
+        sample = {
+            "temp": round(random.uniform(26.0, 30.0), 2),
+            "ph": round(random.uniform(7.5, 8.2), 2),
+            "sal": round(random.uniform(15.0, 20.0), 2),
+            "turb": round(random.uniform(10.0, 30.0), 2)
+        }
+        history_buffer.append(sample)
 
 def parse_lora_data(raw_str):
-    """Parse: Seq, Node_ID, Location, Temp, pH, Sal, Turb"""
     try:
         parts = [p.strip() for p in raw_str.replace("END", "").split(',')]
         if len(parts) >= 7:
@@ -97,24 +93,10 @@ def parse_lora_data(raw_str):
         return None
     except: return None
 
-def write_permanent_log(raw_msg):
-    try:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_FILE, "a") as f: f.write(f"[{ts}] {raw_msg.strip()}\n")
-    except: pass
-
-def save_to_offline_cache(payload):
-    """Lưu dữ liệu vào file khi mất mạng"""
-    try:
-        with open(OFFLINE_CACHE_FILE, "a") as f:
-            f.write(json.dumps(payload) + "\n")
-    except: pass
-
 def flush_offline_cache(client):
-    """Gửi dữ liệu tồn kho khi có mạng lại"""
     if not os.path.exists(OFFLINE_CACHE_FILE): return
     try:
-        print("Flushing offline cache...")
+        print("Đang đẩy dữ liệu từ cache lên MQTT...")
         with open(OFFLINE_CACHE_FILE, "r") as f: lines = f.readlines()
         for line in lines:
             if line.strip():
@@ -128,29 +110,27 @@ def on_connect(client, userdata, flags, rc):
     global mqtt_connected
     if rc == 0:
         mqtt_connected = True
-        print("Connected to HiveMQ Cloud.")
+        print("MQTT: Đã kết nối HiveMQ.")
         status_payload = json.dumps({"device_id": GATEWAY_ID, "status": "ONLINE"})
         client.publish(TOPIC_STATUS, status_payload, qos=1, retain=True)
         flush_offline_cache(client)
-    else:
-        mqtt_connected = False
-        print(f"Connection failed with code {rc}")
+    else: mqtt_connected = False
 
 def on_disconnect(client, userdata, rc):
     global mqtt_connected
     mqtt_connected = False
 
-# --- MAIN PROCESS ---
+# --- CHƯƠNG TRÌNH CHÍNH ---
 def main():
     global mqtt_connected
     
-    # 1. Khởi tạo các thành phần
-    init_buffer()
+    # 1. Khởi tạo
+    init_buffer_with_random()
     try: 
         predictor = ShrimpPredictor(model_path=MODEL_PATH, scaler_path=SCALER_PATH)
     except: 
         predictor = None
-        print("AI Model: Not found, running without prediction.")
+        print("AI Core: Không tìm thấy model.")
     
     ups = UPSMonitor(addr=0x40, bus=1)
     
@@ -158,25 +138,22 @@ def main():
     client = mqtt.Client()
     client.username_pw_set(USERNAME, PASSWORD)
     client.tls_set()
-    will_payload = json.dumps({"device_id": GATEWAY_ID, "status": "OFFLINE"})
-    client.will_set(TOPIC_STATUS, will_payload, qos=1, retain=True)
+    client.will_set(TOPIC_STATUS, json.dumps({"device_id": GATEWAY_ID, "status": "OFFLINE"}), qos=1, retain=True)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     
     try:
         client.connect(BROKER, PORT, 60)
         client.loop_start()
-    except:
-        print("MQTT Initial Connection: Failed")
+    except: pass
     
     # 3. Mở Serial
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     except Exception as e:
-        print(f"Serial Error: {e}")
-        return
+        print(f"Lỗi Serial: {e}"); return
 
-    print(f"Gateway {GATEWAY_ID} started successfully.")
+    print("Hệ thống đã sẵn sàng...")
 
     while True:
         line = ser.readline()
@@ -185,11 +162,13 @@ def main():
                 raw_data = line.decode('utf-8', errors='ignore').strip()
                 if not raw_data: continue
                 
-                write_permanent_log(raw_data)
+                # Ghi log thô
+                with open(LOG_FILE, "a") as f:
+                    f.write(f"[{datetime.now()}] {raw_data}\n")
+
                 parsed = parse_lora_data(raw_data)
-                
                 if parsed:
-                    # Cập nhật dữ liệu cảm biến mới vào buffer
+                    # Cập nhật sensor data thực tế vào buffer
                     current_sensor = {
                         "temp": parsed["temp"], "ph": parsed["ph"], 
                         "sal": parsed["sal"], "turb": parsed["turb"]
@@ -197,25 +176,27 @@ def main():
                     history_buffer.append(current_sensor)
 
                     # --- CHẠY AI DỰ ĐOÁN ---
-                    # Định dạng gọn: [step, temp, ph, sal, turb]
                     formatted_preds = []
                     if predictor:
                         raw_input = [[item[k] for k in FEATURE_KEYS] for item in history_buffer]
                         pred_array = predictor.predict(raw_input)
                         if pred_array is not None:
                             for i, row in enumerate(pred_array[:32]): 
+                                # ĐỊNH DẠNG MẢNG SỐ: [step, temp, ph, sal, turb]
                                 formatted_preds.append([
-                                    i + 1, round(float(row[0]), 2), round(float(row[1]), 2),
-                                    round(float(row[2]), 2), round(float(row[3]), 2)
+                                    i + 1, 
+                                    round(float(row[0]), 2), 
+                                    round(float(row[1]), 2),
+                                    round(float(row[2]), 2), 
+                                    round(float(row[3]), 2)
                                 ])
 
-                    # Đọc trạng thái pin & thời gian
                     batt_stat = ups.read_status()
                     ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # --- XỬ LÝ GỬI DỮ LIỆU ---
+                    # --- GỬI DỮ LIỆU ---
                     if mqtt_connected:
-                        # Bản tin đầy đủ khi ONLINE
+                        # Bản tin đầy đủ
                         payload = {
                             "device_id": GATEWAY_ID,
                             "node_id": parsed["node_id"],
@@ -227,9 +208,9 @@ def main():
                             "battery": batt_stat
                         }
                         client.publish(TOPIC_DATA, json.dumps(payload))
-                        print(f"Sent Online: Node {parsed['node_id']} | Seq {parsed['seq']}")
+                        print(f"MQTT -> Node {parsed['node_id']} (Seq: {parsed['seq']})")
                     else:
-                        # CHỈ LƯU DATA THẬT KHI OFFLINE
+                        # Chỉ lưu dữ liệu thật khi mất mạng
                         cache_payload = {
                             "device_id": GATEWAY_ID,
                             "node_id": parsed["node_id"],
@@ -238,11 +219,12 @@ def main():
                             "seq_id": parsed["seq"],
                             "current_data": current_sensor
                         }
-                        save_to_offline_cache(cache_payload)
-                        print(f"Cached Offline (Real Data Only): Node {parsed['node_id']}")
+                        with open(OFFLINE_CACHE_FILE, "a") as f:
+                            f.write(json.dumps(cache_payload) + "\n")
+                        print(f"Cache -> Node {parsed['node_id']}")
 
             except Exception as e:
-                print(f"Loop Error: {e}")
+                print(f"Lỗi xử lý: {e}")
 
 if __name__ == "__main__":
     main()
