@@ -138,6 +138,7 @@ def main():
     client = mqtt.Client()
     client.username_pw_set(USERNAME, PASSWORD)
     client.tls_set()
+    client.reconnect_delay_set(min_delay=1, max_delay=60)
     client.will_set(TOPIC_STATUS, json.dumps({"device_id": GATEWAY_ID, "status": "OFFLINE"}), qos=1, retain=True)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
@@ -228,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
