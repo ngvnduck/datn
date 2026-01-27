@@ -64,7 +64,7 @@ class UPSMonitor:
                 return "HALT"
             
             # +: Đang sạc, -: Đang xả
-            return f"+{pct}" if current > 5 else f"-{pct}"
+            return pct if current > 5 else -pct
         except:
             return "ERR"
 
@@ -229,4 +229,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
